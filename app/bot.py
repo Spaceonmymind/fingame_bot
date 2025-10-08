@@ -1,17 +1,20 @@
 import os
 import asyncio
 import csv
+import random, string
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from sqlalchemy.orm import Session
 
 from db import SessionLocal, engine, Base
 from models import Registration
+from utils import slots
 
-import random, string
-
-# --- Генерация уникального ID с защитой от дубликатов ---
+# --- Генерация уникального ID ---
 def generate_unique_id(session: Session) -> str:
     while True:
         candidate = "FG-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -22,81 +25,174 @@ def generate_unique_id(session: Session) -> str:
 # --- Инициализация ---
 Base.metadata.create_all(bind=engine)
 bot = Bot(token=os.getenv("BOT_TOKEN"))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# --- Клавиатура выбора игр ---
-game_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🎲 Купимания")],
-        [KeyboardButton(text="🌍 Мир проектов")]
-    ],
-    resize_keyboard=True
-)
+# --- FSM ---
+class RegisterGame(StatesGroup):
+    choosing_game = State()
+    choosing_slot = State()
 
 # --- Старт ---
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет 👋 Добро пожаловать на ФинИгры!\nВыберите игру:",
-        reply_markup=game_keyboard
-    )
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
 
-# --- Регистрация ---
-@dp.message(F.text.in_(["🎲 Купимания", "🌍 Мир проектов"]))
-async def register_game(message: types.Message):
+    game_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Купимания", callback_data="game_kupimania")],
+        [InlineKeyboardButton(text="🌍 Мир проектов", callback_data="game_mir")]
+    ])
+
+    await state.set_state(RegisterGame.choosing_game)
+    await message.answer("Привет 👋 Добро пожаловать на ФинИгры!\nВыберите игру:", reply_markup=game_keyboard)
+
+# --- Выбор игры ---
+@dp.callback_query(F.data.startswith("game_"))
+async def choose_game(callback: types.CallbackQuery, state: FSMContext):
+    game = "Купимания" if callback.data == "game_kupimania" else "Мир проектов"
+
+    session: Session = SessionLocal()
+    existing = session.query(Registration).filter_by(
+        telegram_id=callback.from_user.id, game=game
+    ).first()
+
+    if existing:
+        await callback.message.answer(
+            f"⚠️ Вы уже зарегистрированы!\n"
+            f"Игра: {game}\n"
+            f"Дата: {existing.slot_date}\n"
+            f"Время: {existing.slot_time}\n"
+            f"Ваш ID: {existing.unique_id}"
+        )
+        session.close()
+        await callback.answer()
+        return
+
+    # сохраняем выбор игры
+    await state.update_data(game=game)
+
+    # список доступных слотов
+    available_slots = []
+    for date, times in slots.items():
+        for time in times:
+            count = session.query(Registration).filter_by(game=game, slot_date=date, slot_time=time).count()
+            if count < 4:
+                available_slots.append((date, time))
+    session.close()
+
+    if not available_slots:
+        await callback.message.answer("❌ Для этой игры нет свободных слотов.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    # строим inline кнопки
+    slot_buttons = [[InlineKeyboardButton(text=f"{d} {t}", callback_data=f"slot_{d}_{t}")]
+                    for d, t in available_slots]
+    slot_keyboard = InlineKeyboardMarkup(inline_keyboard=slot_buttons)
+
+    await state.set_state(RegisterGame.choosing_slot)
+    await callback.message.answer(f"Вы выбрали игру: {game}\nТеперь выберите слот:", reply_markup=slot_keyboard)
+    await callback.answer()
+
+# --- Выбор слота ---
+@dp.callback_query(F.data.startswith("slot_"))
+async def register_slot(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_", 2)
+    slot_date, slot_time = parts[1], parts[2]
+
+    data = await state.get_data()
+    game = data.get("game")
+
     session: Session = SessionLocal()
     try:
-        game = message.text.strip()
-
-        # Проверяем, есть ли уже регистрация этого игрока в этой игре
-        existing = (
-            session.query(Registration)
-            .filter_by(telegram_id=message.from_user.id, game=game)
-            .first()
-        )
-
-        if existing:
-            await message.answer(
-                f"⚠️ Вы уже зарегистрированы в этой игре!\n"
-                f"Игра: {game}\n"
-                f"Ваш ID: {existing.unique_id}\n"
-                f"Статус: {'✅ Активен' if not existing.used else '❌ Использован'}"
-            )
+        count = session.query(Registration).filter_by(game=game, slot_date=slot_date, slot_time=slot_time).count()
+        if count >= 4:
+            await callback.message.answer("❌ Этот слот уже заполнен. Попробуйте другой.")
+            await callback.answer()
             return
 
-        # Генерация нового уникального ID
         unique_id = generate_unique_id(session)
-
         reg = Registration(
-            telegram_id=message.from_user.id,
+            telegram_id=callback.from_user.id,
             game=game,
+            slot_date=slot_date,
+            slot_time=slot_time,
             unique_id=unique_id
         )
         session.add(reg)
         session.commit()
 
-        await message.answer(
+        await callback.message.answer(
             f"✅ Регистрация завершена!\n"
             f"Игра: {game}\n"
-            f"Ваш уникальный ID: {unique_id}\n\n"
+            f"Дата: {slot_date}\n"
+            f"Время: {slot_time}\n"
+            f"Ваш ID: {unique_id}\n\n"
             f"Покажите этот код организатору."
         )
 
         await bot.send_message(
             ADMIN_ID,
-            f"✅ Новый ID\nИгра: {game}\nID: {unique_id}"
+            f"✅ Новый ID\nИгра: {game}\nДата: {slot_date}\nВремя: {slot_time}\nID: {unique_id}"
         )
 
     finally:
         session.close()
+        await state.clear()
+        await callback.answer()
 
-# --- Отметить ID как использованный ---
+# --- Админ-команды ---
+@dp.message(Command("list"))
+async def admin_list(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    session: Session = SessionLocal()
+    try:
+        regs = session.query(Registration).order_by(Registration.slot_date, Registration.slot_time).all()
+        if not regs:
+            await message.answer("📭 Пока нет регистраций.")
+            return
+
+        text = "📋 Список регистраций:\n\n"
+        for r in regs:
+            status = "✅ Активен" if not r.used else "❌ Использован"
+            text += f"{r.unique_id} → {r.game} → {r.slot_date} {r.slot_time} → {status}\n"
+
+        await message.answer(text if len(text) < 4000 else text[:4000])
+
+    finally:
+        session.close()
+
+@dp.message(Command("export"))
+async def admin_export(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    session: Session = SessionLocal()
+    try:
+        regs = session.query(Registration).order_by(Registration.slot_date, Registration.slot_time).all()
+        if not regs:
+            await message.answer("📭 Пока нет регистраций.")
+            return
+
+        filename = "registrations.csv"
+        with open(filename, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["unique_id", "game", "slot_date", "slot_time", "telegram_id", "created_at", "status"])
+            for r in regs:
+                status = "active" if not r.used else "used"
+                writer.writerow([r.unique_id, r.game, r.slot_date, r.slot_time, r.telegram_id, r.created_at, status])
+
+        await bot.send_document(ADMIN_ID, FSInputFile(filename, filename))
+        os.remove(filename)
+
+    finally:
+        session.close()
+
 @dp.message(Command("use"))
 async def admin_use(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-
     args = message.text.split()
     if len(args) != 2:
         await message.answer("⚠️ Использование: /use FG-XXXXXX")
@@ -109,65 +205,34 @@ async def admin_use(message: types.Message):
         if not reg:
             await message.answer(f"❌ ID {id_to_use} не найден.")
             return
-
         if reg.used:
             await message.answer(f"⚠️ ID {id_to_use} уже был использован ранее!")
             return
 
         reg.used = True
         session.commit()
-
-        await message.answer(f"✅ ID {id_to_use} отмечен как использованный (игра: {reg.game}).")
+        await message.answer(f"✅ ID {id_to_use} отмечен как использованный ({reg.game}, {reg.slot_date} {reg.slot_time}).")
 
     finally:
         session.close()
 
-# --- Список всех регистраций ---
-@dp.message(Command("list"))
-async def admin_list(message: types.Message):
+@dp.message(Command("active"))
+async def admin_active(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     session: Session = SessionLocal()
     try:
-        regs = session.query(Registration).order_by(Registration.created_at).all()
+        regs = session.query(Registration).filter_by(used=False).order_by(Registration.slot_date, Registration.slot_time).all()
         if not regs:
-            await message.answer("📭 Пока нет регистраций.")
+            await message.answer("📭 Нет активных ID.")
             return
 
-        text = "📋 Список регистраций:\n\n"
+        text = "📋 Активные ID:\n\n"
         for r in regs:
-            status = "✅ Активен" if not r.used else "❌ Использован"
-            text += f"{r.unique_id} → {r.game} → {status}\n"
+            text += f"{r.unique_id} → {r.game} → {r.slot_date} {r.slot_time}\n"
 
-        await message.answer(text)
-    finally:
-        session.close()
+        await message.answer(text if len(text) < 4000 else text[:4000])
 
-# --- Экспорт в CSV ---
-@dp.message(Command("export"))
-async def admin_export(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    session: Session = SessionLocal()
-    try:
-        regs = session.query(Registration).all()
-        if not regs:
-            await message.answer("📭 Пока нет регистраций.")
-            return
-
-        filename = "registrations.csv"
-        with open(filename, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["unique_id", "game", "telegram_id", "created_at", "status"])
-            for r in regs:
-                status = "active" if not r.used else "used"
-                writer.writerow([r.unique_id, r.game, r.telegram_id, r.created_at, status])
-
-        await bot.send_document(
-            ADMIN_ID,
-            FSInputFile(filename, filename)
-        )
-        os.remove(filename)
     finally:
         session.close()
 
