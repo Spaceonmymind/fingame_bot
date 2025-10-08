@@ -26,6 +26,8 @@ def generate_unique_id(session: Session) -> str:
 Base.metadata.create_all(bind=engine)
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
+
+# --- Список администраторов ---
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x]
 
 
@@ -33,6 +35,7 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",
 class RegisterGame(StatesGroup):
     choosing_game = State()
     choosing_slot = State()
+
 
 # --- Старт ---
 @dp.message(CommandStart())
@@ -46,6 +49,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     await state.set_state(RegisterGame.choosing_game)
     await message.answer("Привет 👋 Добро пожаловать на ФинИгры!\nВыберите игру:", reply_markup=game_keyboard)
+
 
 # --- Выбор игры ---
 @dp.callback_query(F.data.startswith("game_"))
@@ -69,10 +73,8 @@ async def choose_game(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # сохраняем выбор игры
     await state.update_data(game=game)
 
-    # список доступных слотов
     available_slots = []
     for date, times in slots.items():
         for time in times:
@@ -87,7 +89,6 @@ async def choose_game(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # строим inline кнопки
     slot_buttons = [[InlineKeyboardButton(text=f"{d} {t}", callback_data=f"slot_{d}_{t}")]
                     for d, t in available_slots]
     slot_keyboard = InlineKeyboardMarkup(inline_keyboard=slot_buttons)
@@ -96,12 +97,12 @@ async def choose_game(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(f"Вы выбрали игру: {game}\nТеперь выберите слот:", reply_markup=slot_keyboard)
     await callback.answer()
 
+
 # --- Выбор слота ---
 @dp.callback_query(F.data.startswith("slot_"))
 async def register_slot(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_", 2)
     slot_date, slot_time = parts[1], parts[2]
-
     data = await state.get_data()
     game = data.get("game")
 
@@ -133,20 +134,30 @@ async def register_slot(callback: types.CallbackQuery, state: FSMContext):
             f"Покажите этот код организатору."
         )
 
-        await bot.send_message(
-            ADMIN_IDS,
-            f"✅ Новый ID\nИгра: {game}\nДата: {slot_date}\nВремя: {slot_time}\nID: {unique_id}"
-        )
+        # Рассылка всем администраторам
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"✅ Новый ID\nИгра: {game}\nДата: {slot_date}\nВремя: {slot_time}\nID: {unique_id}"
+                )
+            except Exception as e:
+                print(f"Ошибка отправки админу {admin_id}: {e}")
 
     finally:
         session.close()
         await state.clear()
         await callback.answer()
 
+
 # --- Админ-команды ---
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 @dp.message(Command("list"))
 async def admin_list(message: types.Message):
-    if message.from_user.id != ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     session: Session = SessionLocal()
     try:
@@ -161,13 +172,13 @@ async def admin_list(message: types.Message):
             text += f"{r.unique_id} → {r.game} → {r.slot_date} {r.slot_time} → {status}\n"
 
         await message.answer(text if len(text) < 4000 else text[:4000])
-
     finally:
         session.close()
 
+
 @dp.message(Command("export"))
 async def admin_export(message: types.Message):
-    if message.from_user.id != ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     session: Session = SessionLocal()
     try:
@@ -184,15 +195,21 @@ async def admin_export(message: types.Message):
                 status = "active" if not r.used else "used"
                 writer.writerow([r.unique_id, r.game, r.slot_date, r.slot_time, r.telegram_id, r.created_at, status])
 
-        await bot.send_document(ADMIN_IDS, FSInputFile(filename, filename))
-        os.remove(filename)
+        # отправляем CSV всем админам
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_document(admin_id, FSInputFile(filename, filename))
+            except Exception as e:
+                print(f"Ошибка при отправке файла админу {admin_id}: {e}")
 
+        os.remove(filename)
     finally:
         session.close()
 
+
 @dp.message(Command("use"))
 async def admin_use(message: types.Message):
-    if message.from_user.id != ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) != 2:
@@ -213,13 +230,13 @@ async def admin_use(message: types.Message):
         reg.used = True
         session.commit()
         await message.answer(f"✅ ID {id_to_use} отмечен как использованный ({reg.game}, {reg.slot_date} {reg.slot_time}).")
-
     finally:
         session.close()
 
+
 @dp.message(Command("active"))
 async def admin_active(message: types.Message):
-    if message.from_user.id != ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         return
     session: Session = SessionLocal()
     try:
@@ -233,9 +250,9 @@ async def admin_active(message: types.Message):
             text += f"{r.unique_id} → {r.game} → {r.slot_date} {r.slot_time}\n"
 
         await message.answer(text if len(text) < 4000 else text[:4000])
-
     finally:
         session.close()
+
 
 # --- Запуск ---
 async def main():
