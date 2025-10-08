@@ -26,7 +26,8 @@ def generate_unique_id(session: Session) -> str:
 Base.metadata.create_all(bind=engine)
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").replace(" ", "").split(",") if x]
+
 
 # --- FSM ---
 class RegisterGame(StatesGroup):
@@ -133,7 +134,7 @@ async def register_slot(callback: types.CallbackQuery, state: FSMContext):
         )
 
         await bot.send_message(
-            ADMIN_ID,
+            ADMIN_IDS,
             f"✅ Новый ID\nИгра: {game}\nДата: {slot_date}\nВремя: {slot_time}\nID: {unique_id}"
         )
 
@@ -145,7 +146,7 @@ async def register_slot(callback: types.CallbackQuery, state: FSMContext):
 # --- Админ-команды ---
 @dp.message(Command("list"))
 async def admin_list(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return
     session: Session = SessionLocal()
     try:
@@ -166,7 +167,7 @@ async def admin_list(message: types.Message):
 
 @dp.message(Command("export"))
 async def admin_export(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return
     session: Session = SessionLocal()
     try:
@@ -183,7 +184,7 @@ async def admin_export(message: types.Message):
                 status = "active" if not r.used else "used"
                 writer.writerow([r.unique_id, r.game, r.slot_date, r.slot_time, r.telegram_id, r.created_at, status])
 
-        await bot.send_document(ADMIN_ID, FSInputFile(filename, filename))
+        await bot.send_document(ADMIN_IDS, FSInputFile(filename, filename))
         os.remove(filename)
 
     finally:
@@ -191,7 +192,7 @@ async def admin_export(message: types.Message):
 
 @dp.message(Command("use"))
 async def admin_use(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return
     args = message.text.split()
     if len(args) != 2:
@@ -218,7 +219,7 @@ async def admin_use(message: types.Message):
 
 @dp.message(Command("active"))
 async def admin_active(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id != ADMIN_IDS:
         return
     session: Session = SessionLocal()
     try:
